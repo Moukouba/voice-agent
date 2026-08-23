@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 import httpx
 from typing import AsyncIterable
 from dataclasses import dataclass
@@ -16,12 +17,18 @@ from livekit.agents import (
     stt,
     inference,
     llm,
+    AgentStateChangedEvent,
+    MetricsCollectedEvent,
+    metrics,
 )
 from livekit.plugins import silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit import rtc
 
 from system_prompt import SYSTEM_PROMPT
+
+import os
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 logger = logging.getLogger("multilingual-logistics-agent")
 load_dotenv()
@@ -123,12 +130,9 @@ class MultilingualLogisticsAgent(Agent):
 
     def _is_transcript_event(self, event: stt.SpeechEvent) -> bool:
         """Check if event is a transcript event with language information."""
+        # Restrict to FINAL_TRANSCRIPT to prevent async queue bottlenecks
         return (
-            event.type
-            in [
-                stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                stt.SpeechEventType.FINAL_TRANSCRIPT,
-            ]
+            event.type == stt.SpeechEventType.FINAL_TRANSCRIPT
             and event.alternatives
         )
 
@@ -137,6 +141,13 @@ class MultilingualLogisticsAgent(Agent):
         detected_language = event.alternatives[0].language
         if not detected_language:
             return
+            
+        base_lang = detected_language.split("-")[0].lower()
+        
+        # Guard clause: Ignore any language not strictly in our supported mapping (en, fr, es)
+        if base_lang not in self.STT_TO_RIME:
+            return
+
         effective_language = self._update_tts_for_language(detected_language)
         if effective_language != self._current_language:
             self._current_language = effective_language
@@ -201,12 +212,41 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_detection=MultilingualModel(),
     )
 
+    # --- Metrics Tracking Logic (merged from Code #2) ---
+    usage_collector = metrics.UsageCollector()
+    last_eou_metrics: metrics.EOUMetrics | None = None
+
+    @session.on("metrics_collected")
+    def _on_metrics_collected(ev: MetricsCollectedEvent):
+        nonlocal last_eou_metrics
+        # Capture EOU metrics for TTFA calculation
+        if ev.metrics.type == "eou_metrics":
+            last_eou_metrics = ev.metrics
+
+        # Log each metric as it arrives and add to usage collector
+        metrics.log_metrics(ev.metrics)
+        usage_collector.collect(ev.metrics)
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev: AgentStateChangedEvent):
+        if ev.new_state == "speaking":
+            if last_eou_metrics:
+                # Calculate time since user finished speaking
+                elapsed = time.time() - last_eou_metrics.timestamp
+                logger.info(f"Time to first audio: {elapsed:.3f}s")
+
     async def log_usage() -> None:
         """Log usage summary on shutdown."""
+        # Print per-session summary (tokens, audio duration, costs)
+        summary = usage_collector.get_summary()
+        logger.info("Usage summary: %s", summary)
+        
+        # Retain original logging loop as well
         for usage in session.usage.model_usage:
             logger.info(f"Usage: {usage.provider}/{usage.model}: {usage}")
 
     ctx.add_shutdown_callback(log_usage)
+    # ----------------------------------------------------
 
     agent = MultilingualLogisticsAgent()
     agent._room = ctx.room
